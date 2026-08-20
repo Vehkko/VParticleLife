@@ -1,4 +1,4 @@
-# ParticleLife
+# VParticleLife
 
 A real-time 2D particle-life simulation written in C++17.
 
