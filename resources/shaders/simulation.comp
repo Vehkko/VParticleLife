@@ -1,0 +1,343 @@
+#version 430 core
+
+#ifndef LOCAL_SIZE
+#define LOCAL_SIZE 256
+#endif
+
+layout(local_size_x = LOCAL_SIZE) in;
+
+// Current particle order. The backend ping-pongs these buffers every step.
+layout(std430, binding = 0) buffer CurrentParticleState {
+    vec4 state[]; // x, y, vx, vy
+};
+
+layout(std430, binding = 1) readonly buffer CurrentParticleType {
+    uint type[];
+};
+
+// Acceleration/local relaxation always match the particle order that will
+// become current after the force pass.
+layout(std430, binding = 2) buffer Acceleration {
+    vec2 acceleration[];
+};
+
+layout(std430, binding = 3) buffer LocalRelaxation {
+    vec4 localRelaxation[]; // weighted velocity sum xy, total weight z
+};
+
+layout(std430, binding = 4) buffer CellCursor {
+    uint cellCursor[];
+};
+
+layout(std430, binding = 5) buffer CellOffset {
+    uint cellOffset[];
+};
+
+// Physical spatial reorder target. After force / final kick the host swaps
+// these buffers with bindings 0/1 instead of copying the data back.
+layout(std430, binding = 6) buffer NextParticleState {
+    vec4 nextState[];
+};
+
+layout(std430, binding = 7) buffer NextParticleType {
+    uint nextType[];
+};
+
+uniform int   uStage;
+uniform uint  uParticleCount;
+uniform uint  uTypeCount;
+uniform uint  uCellCount;
+uniform uvec2 uGridCount;
+uniform vec2  uInvCellSize;
+uniform ivec2 uNeighborRange;
+uniform vec2  uWorldSize;
+uniform vec2  uHalfWorldSize;
+uniform int   uBoundaryMode; // 0 periodic, 1 reflective
+uniform float uRestitution;
+uniform float uDt;
+uniform float uHalfDt;
+uniform float uGlobalDampingFactor;
+uniform float uLocalDampingDt2;
+uniform float uCoreRadius2;
+uniform float uInteractionSpanInv;
+uniform float uCoreStrength;
+
+uniform float uInvMass[16];
+uniform float uInteraction[256];
+
+const float INTERACTION_RADIUS_SQUARE = 1.0;
+const float MIN_DISTANCE_SQUARE = 1.0e-8;
+
+shared uint prefixBase[LOCAL_SIZE];
+
+uint cell_x(float x)
+{
+    int c = int((x + uHalfWorldSize.x) * uInvCellSize.x);
+    return uint(clamp(c, 0, int(uGridCount.x) - 1));
+}
+
+uint cell_y(float y)
+{
+    int c = int((y + uHalfWorldSize.y) * uInvCellSize.y);
+    return uint(clamp(c, 0, int(uGridCount.y) - 1));
+}
+
+uint cell_index(vec2 p)
+{
+    return cell_y(p.y) * uGridCount.x + cell_x(p.x);
+}
+
+void apply_boundary(inout vec2 p, inout vec2 v)
+{
+    if (uBoundaryMode == 0) {
+        if (p.x >= uHalfWorldSize.x)
+            p.x -= uWorldSize.x;
+        else if (p.x < -uHalfWorldSize.x)
+            p.x += uWorldSize.x;
+
+        if (p.y >= uHalfWorldSize.y)
+            p.y -= uWorldSize.y;
+        else if (p.y < -uHalfWorldSize.y)
+            p.y += uWorldSize.y;
+        return;
+    }
+
+    if (p.x > uHalfWorldSize.x) {
+        p.x = 2.0 * uHalfWorldSize.x - p.x;
+        v.x = -v.x * uRestitution;
+    } else if (p.x < -uHalfWorldSize.x) {
+        p.x = -2.0 * uHalfWorldSize.x - p.x;
+        v.x = -v.x * uRestitution;
+    }
+
+    if (p.y > uHalfWorldSize.y) {
+        p.y = 2.0 * uHalfWorldSize.y - p.y;
+        v.y = -v.y * uRestitution;
+    } else if (p.y < -uHalfWorldSize.y) {
+        p.y = -2.0 * uHalfWorldSize.y - p.y;
+        v.y = -v.y * uRestitution;
+    }
+}
+
+void count_particle(vec2 p)
+{
+    atomicAdd(cellCursor[cell_index(p)], 1u);
+}
+
+void stage_kick_drift(uint i)
+{
+    vec4 s = state[i];
+    vec2 v = s.zw + acceleration[i] * uHalfDt;
+    vec2 p = s.xy + v * uDt;
+    apply_boundary(p, v);
+    state[i] = vec4(p, v);
+    count_particle(p);
+}
+
+void stage_count_grid(uint i)
+{
+    count_particle(state[i].xy);
+}
+
+void stage_prefix_grid()
+{
+    uint lane = gl_LocalInvocationID.x;
+    uint laneCount = gl_WorkGroupSize.x;
+    uint chunkSize = (uCellCount + laneCount - 1u) / laneCount;
+    uint begin = lane * chunkSize;
+    uint end = min(begin + chunkSize, uCellCount);
+
+    uint localSum = 0u;
+    for (uint cell = begin; cell < end; ++cell)
+        localSum += cellCursor[cell];
+
+    prefixBase[lane] = localSum;
+    barrier();
+
+    if (lane == 0u) {
+        uint running = 0u;
+        for (uint t = 0u; t < laneCount; ++t) {
+            uint chunkSum = prefixBase[t];
+            prefixBase[t] = running;
+            running += chunkSum;
+        }
+        cellOffset[uCellCount] = running;
+    }
+    barrier();
+
+    uint running = prefixBase[lane];
+    for (uint cell = begin; cell < end; ++cell) {
+        uint count = cellCursor[cell];
+        cellOffset[cell] = running;
+        cellCursor[cell] = running;
+        running += count;
+    }
+}
+
+void stage_scatter_grid(uint i)
+{
+    vec4 s = state[i];
+    uint cell = cell_index(s.xy);
+    uint dst = atomicAdd(cellCursor[cell], 1u);
+
+    // Reorder the actual hot particle data, not just an index array. Force
+    // traversal can now read every neighbor cell as contiguous vec4/uint data.
+    nextState[dst] = s;
+    nextType[dst] = type[i];
+}
+
+void stage_force(uint i)
+{
+    vec4 si = nextState[i];
+    vec2 pi = si.xy;
+    uint typeI = nextType[i];
+
+    uint cx = cell_x(pi.x);
+    uint cy = cell_y(pi.y);
+
+    vec2 a = vec2(0.0);
+    vec2 localVelocitySum = vec2(0.0);
+    float localWeight = 0.0;
+
+    int gridX = int(uGridCount.x);
+    int gridY = int(uGridCount.y);
+
+    for (int oy = -uNeighborRange.y; oy <= uNeighborRange.y; ++oy) {
+        int ny = int(cy) + oy;
+
+        if (uBoundaryMode == 0) {
+            if (ny < 0)
+                ny += gridY;
+            else if (ny >= gridY)
+                ny -= gridY;
+        } else if (ny < 0 || ny >= gridY) {
+            continue;
+        }
+
+        for (int ox = -uNeighborRange.x; ox <= uNeighborRange.x; ++ox) {
+            int nx = int(cx) + ox;
+
+            if (uBoundaryMode == 0) {
+                if (nx < 0)
+                    nx += gridX;
+                else if (nx >= gridX)
+                    nx -= gridX;
+            } else if (nx < 0 || nx >= gridX) {
+                continue;
+            }
+
+            uint cell = uint(ny) * uGridCount.x + uint(nx);
+            uint begin = cellOffset[cell];
+            uint end = cellOffset[cell + 1u];
+
+            // Neighbor state/type are physically contiguous by cell.
+            for (uint j = begin; j < end; ++j) {
+                if (j == i)
+                    continue;
+
+                vec4 sj = nextState[j];
+                vec2 d = sj.xy - pi;
+
+                if (uBoundaryMode == 0) {
+                    if (d.x > uHalfWorldSize.x)
+                        d.x -= uWorldSize.x;
+                    else if (d.x < -uHalfWorldSize.x)
+                        d.x += uWorldSize.x;
+
+                    if (d.y > uHalfWorldSize.y)
+                        d.y -= uWorldSize.y;
+                    else if (d.y < -uHalfWorldSize.y)
+                        d.y += uWorldSize.y;
+                }
+
+                float d2 = dot(d, d);
+                if (d2 > INTERACTION_RADIUS_SQUARE)
+                    continue;
+
+                float f;
+                if (d2 < uCoreRadius2) {
+                    f = -uCoreStrength / max(d2, MIN_DISTANCE_SQUARE);
+
+                    if (uLocalDampingDt2 > 0.0) {
+                        float weight = 1.0 - d2 / uCoreRadius2;
+                        localVelocitySum += weight * sj.zw;
+                        localWeight += weight;
+                    }
+                } else {
+                    uint typeJ = nextType[j];
+                    float t = (d2 - uCoreRadius2) * uInteractionSpanInv;
+                    float g = 4.0 * t * (1.0 - t);
+                    f = -uInteraction[typeI * uTypeCount + typeJ] * g;
+                }
+
+                a += f * d;
+            }
+        }
+    }
+
+    float invMass = uInvMass[typeI];
+    acceleration[i] = a * invMass;
+    if (uLocalDampingDt2 > 0.0)
+        localRelaxation[i] = vec4(localVelocitySum, localWeight, 0.0);
+}
+
+vec2 finish_velocity_next(uint i, vec2 v, vec2 a)
+{
+    uint typeI = nextType[i];
+    v += a * uHalfDt;
+
+    vec4 local = localRelaxation[i];
+    if (local.z > 0.0 && uLocalDampingDt2 > 0.0) {
+        vec2 meanVelocity = local.xy / local.z;
+        float blend = 0.5 * (1.0 - exp(-uLocalDampingDt2 * local.z *
+                                       uInvMass[typeI]));
+        v += blend * (meanVelocity - v);
+    }
+
+    return v * uGlobalDampingFactor;
+}
+
+void stage_kick_damping(uint i)
+{
+    vec4 s = nextState[i];
+    nextState[i].zw = finish_velocity_next(i, s.zw, acceleration[i]);
+}
+
+void stage_finish_begin_next(uint i)
+{
+    vec4 s = nextState[i];
+    vec2 a = acceleration[i];
+    vec2 v = finish_velocity_next(i, s.zw, a);
+
+    v += a * uHalfDt;
+    vec2 p = s.xy + v * uDt;
+    apply_boundary(p, v);
+    nextState[i] = vec4(p, v);
+    count_particle(p);
+}
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+
+    if (uStage == 2) {
+        stage_prefix_grid();
+        return;
+    }
+
+    if (i >= uParticleCount)
+        return;
+
+    if (uStage == 0)
+        stage_kick_drift(i);
+    else if (uStage == 1)
+        stage_count_grid(i);
+    else if (uStage == 3)
+        stage_scatter_grid(i);
+    else if (uStage == 4)
+        stage_force(i);
+    else if (uStage == 5)
+        stage_kick_damping(i);
+    else if (uStage == 6)
+        stage_finish_begin_next(i);
+}

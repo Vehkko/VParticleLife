@@ -1,0 +1,12 @@
+# Build artifacts
+build/
+dist/
+
+# Xmake
+.xmake/
+
+# Generated files
+compile_commands.json
+
+# Cache
+.cache/
