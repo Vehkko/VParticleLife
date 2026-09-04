@@ -32,7 +32,8 @@ add_requires("glfw", {
 	},
 })
 
-add_requires("glad", {
+add_requires("glad v0.1.36", {
+	system = false,
 	configs = {
 		api = "gl=4.6",
 		profile = "core",
